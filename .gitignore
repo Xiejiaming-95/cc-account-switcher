@@ -3,6 +3,9 @@ __pycache__/
 .tmp_home/
 accounts/
 CLAUDE.md
-*.md
+docs/
+tests/
+gen_flowchart.py
+2026-*.md
 docs/
 tests/
