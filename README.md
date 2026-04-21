@@ -33,9 +33,31 @@ python claude_switch.py
 
 ---
 
-## 交互流程
+## 运行效果
 
-![交互流程图](flowchart.jpg)
+### 主菜单
+
+启动后显示当前登录账号及状态，输入数字选择功能：
+
+![主菜单](screenshots/01_main_menu.png)
+
+### 保存当前账号
+
+选择 `1`，输入备注名（直接回车可用当前邮箱作为名称）：
+
+![保存账号](screenshots/02_save.png)
+
+### 切换到已保存账号
+
+选择 `2`，从列表中选择目标账号，确认已关闭 Claude 窗口后自动完成切换：
+
+![切换账号](screenshots/03_switch.png)
+
+### 查看账号列表
+
+选择 `3`，列出所有已保存账号的详细信息：
+
+![查看列表](screenshots/04_list.png)
 
 ---
 
@@ -53,7 +75,7 @@ python claude_switch.py
 cc-account-switcher/
 ├── claude_switch.py   # 核心逻辑
 ├── claude_switch.bat  # Windows 快速启动入口
-├── flowchart.jpg      # 交互流程图
+├── screenshots/       # README 使用的运行效果截图
 └── accounts/          # 账号快照目录（本地自动生成，不上传）
     └── 账号备注名/
         ├── credentials.json

@@ -6,6 +6,6 @@ CLAUDE.md
 docs/
 tests/
 gen_flowchart.py
+gen_screenshots.py
+flowchart.jpg
 2026-*.md
-docs/
-tests/
