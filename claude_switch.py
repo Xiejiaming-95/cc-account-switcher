@@ -3,10 +3,21 @@ from __future__ import annotations
 import json
 import os
 import shutil
-from datetime import datetime
+import socket
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 INVALID_NAME_CHARS = '<>:"/\\|?*'
+
+USAGE_API_URL = "https://api.anthropic.com/api/oauth/usage"
+OAUTH_BETA_HEADER = "oauth-2025-04-20"
+USAGE_TIMEOUT_SECONDS = 5
+USAGE_CACHE_TTL_SECONDS = 60
+
+# 进程内存缓存：失败也缓存，避免反复撞 5 秒超时。
+_usage_cache: dict = {"fetched_at": None, "result": None}
 
 # Windows 文件/目录名保留名（大小写不敏感，且即使带扩展名也不可用）。
 WINDOWS_RESERVED_NAMES = {
@@ -98,6 +109,161 @@ def try_read_current_email(config_path: Path | None) -> str:
     if isinstance(email, str):
         return email.strip()
     return ""
+
+
+def read_access_token(user_home: Path | None = None) -> str | None:
+    credentials_path = get_credentials_path(user_home)
+    if not credentials_path.exists():
+        return None
+    try:
+        data = load_json_file(credentials_path)
+    except (json.JSONDecodeError, OSError, ValueError):
+        return None
+
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return None
+    token = oauth.get("accessToken")
+    if isinstance(token, str) and token.strip():
+        return token.strip()
+    return None
+
+
+def fetch_usage_data(access_token: str) -> dict:
+    # 成功返回原始 dict；失败抛 RuntimeError，消息对应 4 种降级文案。
+    request = urllib.request.Request(
+        USAGE_API_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "anthropic-beta": OAUTH_BETA_HEADER,
+            "User-Agent": "claude-switch/1.0",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=USAGE_TIMEOUT_SECONDS) as response:
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as error:
+        if error.code in (401, 403):
+            raise RuntimeError("令牌无效或已过期") from error
+        raise RuntimeError("返回数据异常") from error
+    except (urllib.error.URLError, socket.timeout, TimeoutError):
+        raise RuntimeError("请求超时或网络不可用")
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("返回数据异常") from error
+    if not isinstance(data, dict):
+        raise RuntimeError("返回数据异常")
+    return data
+
+
+def format_usage_countdown(resets_at: str) -> tuple[str, str]:
+    # 返回 (倒计时, 重置时刻)；倒计时用 "Nd Nh" / "Nh Nm" / "Nm"，时刻根据是否跨日变化。
+    normalized = resets_at.replace("Z", "+00:00") if resets_at.endswith("Z") else resets_at
+    reset_utc = datetime.fromisoformat(normalized)
+    if reset_utc.tzinfo is None:
+        reset_utc = reset_utc.replace(tzinfo=timezone.utc)
+
+    now_utc = datetime.now(timezone.utc)
+    remaining_seconds = max(0, int((reset_utc - now_utc).total_seconds()))
+    days, remainder = divmod(remaining_seconds, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+
+    if days > 0:
+        countdown = f"{days}d {hours}h"
+    elif hours > 0:
+        countdown = f"{hours}h {minutes}m"
+    else:
+        countdown = f"{minutes}m"
+
+    reset_local = reset_utc.astimezone()
+    if reset_local.date() == now_utc.astimezone().date():
+        clock = reset_local.strftime("%H:%M")
+    else:
+        clock = reset_local.strftime("%m-%d %H:%M")
+    return countdown, clock
+
+
+def build_usage_summary(raw: dict) -> dict | None:
+    summary: dict = {}
+    for key in ("five_hour", "seven_day"):
+        section = raw.get(key)
+        if not isinstance(section, dict):
+            continue
+        utilization = section.get("utilization")
+        if not isinstance(utilization, (int, float)):
+            continue
+        entry: dict = {"pct": int(utilization)}
+        resets_at = section.get("resets_at")
+        if isinstance(resets_at, str) and resets_at.strip():
+            try:
+                countdown, clock = format_usage_countdown(resets_at)
+            except ValueError:
+                countdown, clock = "", ""
+            if countdown:
+                entry["countdown"] = countdown
+            if clock:
+                entry["clock"] = clock
+        summary[key] = entry
+    return summary or None
+
+
+def get_current_usage(user_home: Path | None = None) -> dict:
+    # 成功: {"status": "ok", "data": {...}}
+    # 失败: {"status": "error", "message": "..."}
+    # 命中缓存时两者都会附带 "cached": True（60s 内）。
+    now = datetime.now(timezone.utc)
+    fetched_at = _usage_cache.get("fetched_at")
+    cached_result = _usage_cache.get("result")
+    if (
+        isinstance(fetched_at, datetime)
+        and cached_result is not None
+        and (now - fetched_at).total_seconds() < USAGE_CACHE_TTL_SECONDS
+    ):
+        return {**cached_result, "cached": True}
+
+    access_token = read_access_token(user_home)
+    if not access_token:
+        result = {"status": "error", "message": "未找到访问令牌"}
+    else:
+        try:
+            raw = fetch_usage_data(access_token)
+        except RuntimeError as error:
+            result = {"status": "error", "message": str(error)}
+        else:
+            summary = build_usage_summary(raw)
+            if summary is None:
+                result = {"status": "error", "message": "返回数据异常"}
+            else:
+                result = {"status": "ok", "data": summary}
+
+    _usage_cache["fetched_at"] = now
+    _usage_cache["result"] = result
+    return {**result, "cached": False}
+
+
+def print_current_usage(result: dict) -> None:
+    if result.get("status") != "ok":
+        message = result.get("message") or "未知错误"
+        print(f"订阅用量：无法获取（{message}）")
+        return
+
+    data = result.get("data") or {}
+    print("订阅用量：")
+    labels = (("five_hour", "5 小时窗口"), ("seven_day", "7 天窗口  "))
+    for key, label in labels:
+        entry = data.get(key)
+        if not entry:
+            continue
+        pct = entry.get("pct", 0)
+        clock = entry.get("clock", "")
+        countdown = entry.get("countdown", "")
+        if clock and countdown:
+            print(f"  {label}：{pct}%   下次重置 {clock}（还剩 {countdown}）")
+        else:
+            print(f"  {label}：{pct}%")
 
 
 def read_account_meta(account_dir: Path) -> dict:
@@ -524,6 +690,7 @@ def main() -> None:
         current_email, status_text = get_current_status(accounts_dir)
         print(f"当前登录账号：{current_email}")
         print(f"当前账号状态：{status_text}")
+        print_current_usage(get_current_usage())
         print_main_menu()
 
         choice = prompt_menu_choice()
